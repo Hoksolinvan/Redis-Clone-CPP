@@ -309,6 +309,15 @@ else if(RESP_array.size() > 2 && RESP_array[2] == "lpop"){
   } 
   else if(RESP_array.size()>2 && RESP_array[2]=="TYPE"){
 
+      if(type.find(RESP_array[4]) != type.end()){
+
+        send(client_fd, "+string\r\n",strlen("+string\r\n"),0);
+      }
+      else{
+
+        send(client_fd,"+none\r\n",strlen("+none\r\n"),0);
+
+      }
   }
 
   else{
