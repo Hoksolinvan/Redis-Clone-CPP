@@ -17,11 +17,28 @@
 #include <chrono>
 #include <cmath>
 #include <queue>
+#include <mutex>
+#include <condition_variable>
 
 std::unordered_map<std::string, std::tuple<std::string,int,std::chrono::time_point<std::chrono::high_resolution_clock>>> global_dictionary;
 std::unordered_map<std::string, std::vector<std::string>> RList;
-std::unordered_map<std::string, std::chrono::time_point<std::chrono::high_resolution_clock>> BLPOP;
+std::unordered_map<std::string,std::string> type;
 
+// BLPOP: map from key -> list of {arrival_time, client_fd} waiters
+struct WaitEntry {
+  std::chrono::steady_clock::time_point arrival;
+  int client_fd;
+};
+std::unordered_map<std::string, std::vector<WaitEntry>> BLPOP;
+std::unordered_map<std::string, std::condition_variable*> BLPOP_cv;
+std::mutex blpop_mutex;
+
+
+
+std::string make_bulk(const std::string& input_1, const std::string& input_2){
+  std::string result = input_1+"\r\n"+input_2+"\r\n";
+  return result;
+}
 
 
 std::vector<std::string> parser(const std::string& input_string, std::string delimiter="\r\n"){
@@ -45,11 +62,6 @@ std::vector<std::string> parser(const std::string& input_string, std::string del
  
 
     return current;
-}
-
-std::string make_bulk(const std::string& input_1, const std::string& input_2){
-  std::string result = input_1+"\r\n"+input_2+"\r\n";
-  return result;
 }
 
 
@@ -81,6 +93,8 @@ void handler(int client_fd){
        std::get<1>(global_dictionary[RESP_array[4]])= std::stoi(RESP_array[10]);
     }
 
+    type[RESP_array[4]]="string";
+
 
       send(client_fd, "+OK\r\n",strlen("+OK\r\n"),0);
     
@@ -109,13 +123,34 @@ void handler(int client_fd){
     }
   }
   else if(RESP_array.size()>2 && RESP_array[2]=="rpush"){
-   
-    for(int i=6;i<RESP_array.size()-1;i+=2){
-        RList[RESP_array[4]].push_back(RESP_array[i]);
-    }
-    
+    std::string key = RESP_array[4];
+    size_t list_size = 0;
 
-    std::string temp = ":" + std::to_string(RList[RESP_array[4]].size())+"\r\n";
+    {
+      std::lock_guard<std::mutex> lock(blpop_mutex);
+      for(int i=6;i<(int)RESP_array.size()-1;i+=2){
+          RList[key].push_back(RESP_array[i]);
+      }
+      list_size = RList[key].size();
+
+      // Wake the longest-waiting BLPOP client for this key, if any
+      auto wit = BLPOP.find(key);
+      if(wit != BLPOP.end() && !wit->second.empty() && !RList[key].empty()){
+        auto earliest = wit->second.begin();
+        for(auto it = wit->second.begin(); it != wit->second.end(); ++it){
+          if(it->arrival < earliest->arrival) earliest = it;
+        }
+        std::string val = RList[key].front();
+        RList[key].erase(RList[key].begin());
+        std::string resp = "*2\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n"
+                         + "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
+        send(earliest->client_fd, resp.c_str(), resp.size(), 0);
+        wit->second.erase(earliest);
+        if(BLPOP_cv.count(key)) BLPOP_cv[key]->notify_all();
+      }
+    }
+
+    std::string temp = ":" + std::to_string(list_size)+"\r\n";
     send(client_fd,temp.c_str(),temp.length(),0);
    
    
@@ -169,13 +204,34 @@ void handler(int client_fd){
   }
 }
 else if(RESP_array.size() > 2 && RESP_array[2] == "lpush"){
+    std::string key = RESP_array[4];
+    size_t list_size = 0;
 
-    for(int i=6;i<RESP_array.size()-1;i+=2){
-        RList[RESP_array[4]].insert(RList[RESP_array[4]].begin(),RESP_array[i]);
+    {
+      std::lock_guard<std::mutex> lock(blpop_mutex);
+      for(int i=6;i<(int)RESP_array.size()-1;i+=2){
+          RList[key].insert(RList[key].begin(),RESP_array[i]);
+      }
+      list_size = RList[key].size();
+
+      // Wake the longest-waiting BLPOP client for this key, if any
+      auto wit = BLPOP.find(key);
+      if(wit != BLPOP.end() && !wit->second.empty() && !RList[key].empty()){
+        auto earliest = wit->second.begin();
+        for(auto it = wit->second.begin(); it != wit->second.end(); ++it){
+          if(it->arrival < earliest->arrival) earliest = it;
+        }
+        std::string val = RList[key].front();
+        RList[key].erase(RList[key].begin());
+        std::string resp = "*2\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n"
+                         + "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
+        send(earliest->client_fd, resp.c_str(), resp.size(), 0);
+        wit->second.erase(earliest);
+        if(BLPOP_cv.count(key)) BLPOP_cv[key]->notify_all();
+      }
     }
-    
 
-    std::string temp = ":" + std::to_string(RList[RESP_array[4]].size())+"\r\n";
+    std::string temp = ":" + std::to_string(list_size)+"\r\n";
     send(client_fd,temp.c_str(),temp.length(),0);
    
 }
@@ -216,14 +272,61 @@ else if(RESP_array.size() > 2 && RESP_array[2] == "lpop"){
 
 }
   else if(RESP_array.size() > 2 && RESP_array[2] == "blpop"){
-    auto x = std::chrono::high_resolution_clock::time_point::min();
-  if(RESP_array[6]!="0"){
-    x = std::chrono::high_resolution_clock::now() + std::chrono::seconds(std::stoi(RESP_array[6]));
-  }
+    std::string key = RESP_array[4];
+    float timeout_sec = std::stof(RESP_array[6]);
 
-BLPOP[RESP_array[4]] = x ;     
+    std::unique_lock<std::mutex> ulock(blpop_mutex);
 
+    // Serve immediately if list already has elements
+    if(!RList[key].empty()){
+      std::string val = RList[key].front();
+      RList[key].erase(RList[key].begin());
+      std::string resp = "*2\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n"
+                       + "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
+      ulock.unlock();
+      send(client_fd, resp.c_str(), resp.size(), 0);
+      continue;
+    }
+
+    // Register this client as a waiter
+    if(!BLPOP_cv.count(key)) BLPOP_cv[key] = new std::condition_variable();
+    BLPOP[key].push_back({std::chrono::steady_clock::now(), client_fd});
+
+    // Predicate: we've been removed from the waiters list (i.e. served)
+    auto pred = [&](){
+      for(auto& w : BLPOP[key])
+        if(w.client_fd == client_fd) return false;
+      return true;
+    };
+
+    if(timeout_sec == 0){
+      BLPOP_cv[key]->wait(ulock, pred);
+    } else {
+      auto timeout_ms = std::chrono::milliseconds((int)(timeout_sec * 1000));
+      bool served = BLPOP_cv[key]->wait_for(ulock, timeout_ms, pred);
+      if(!served){
+        // Timed out — remove ourselves and send null array
+        auto& waiters = BLPOP[key];
+        waiters.erase(std::remove_if(waiters.begin(), waiters.end(),
+          [&](const WaitEntry& w){ return w.client_fd == client_fd; }), waiters.end());
+        ulock.unlock();
+        send(client_fd, "*-1\r\n", 5, 0);
+      }
+    }
+    // If served, response was already sent by rpush/lpush handler
   } 
+  else if(RESP_array.size()>2 && RESP_array[2]=="type"){
+
+      if(type.find(RESP_array[4]) != type.end()){
+
+        send(client_fd, "+string\r\n",strlen("+string\r\n"),0);
+      }
+      else{
+
+        send(client_fd,"+none\r\n",strlen("+none\r\n"),0);
+
+      }
+  }
 
   else{
     send(client_fd,"+PONG\r\n",7,0);
@@ -274,6 +377,8 @@ int main(int argc, char **argv) {
   int client_addr_len = sizeof(client_addr);
   std::cout << "Waiting for a client to connect...\n";
 
+  // You can use print statements as follows for debugging, they'll be visible when running tests.
+  std::cout << "Logs from your program will appear here!\n";
   
   
 
