@@ -105,7 +105,7 @@ XADD events 0-9 action "past"               → ERR (smaller ID)
  
 ## Architecture Notes
  
-- ** Boost.Asio** — networking is raw POSIX (`socket`, `bind`, `listen`, `accept`, `recv`, `send`)
+- **Boost.Asio** — networking is raw POSIX (`socket`, `bind`, `listen`, `accept`, `recv`, `send`)
 - **Parser** — a simple `\r\n`-delimited tokenizer that handles RESP2 arrays
 - **Thread model** — one `std::thread` per client, detached; shared state protected by `std::mutex`
 - **BLPOP wake-up** — `RPUSH`/`LPUSH` directly checks the waiter list under the same mutex and sends the response to the blocked client's `fd`
