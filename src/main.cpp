@@ -19,11 +19,11 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <sstream>
 
 std::unordered_map<std::string, std::tuple<std::string,int,std::chrono::time_point<std::chrono::high_resolution_clock>>> global_dictionary;
 std::unordered_map<std::string, std::vector<std::string>> RList;
 std::unordered_map<std::string,std::string> type;
-
 // BLPOP: map from key -> list of {arrival_time, client_fd} waiters
 struct WaitEntry {
   std::chrono::steady_clock::time_point arrival;
@@ -33,6 +33,14 @@ std::unordered_map<std::string, std::vector<WaitEntry>> BLPOP;
 std::unordered_map<std::string, std::condition_variable*> BLPOP_cv;
 std::mutex blpop_mutex;
 
+struct stream{
+  std::string time;
+  std::string seq;
+  std::vector<std::string> container;
+};
+
+std::unordered_map<std::string, std::vector<stream>> redis_stream;
+
 
 
 std::string make_bulk(const std::string& input_1, const std::string& input_2){
@@ -40,6 +48,17 @@ std::string make_bulk(const std::string& input_1, const std::string& input_2){
   return result;
 }
 
+std::vector<std::string> split(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::stringstream ss(s);
+    std::string item;
+
+    while (std::getline(ss, item, delimiter)) {
+        tokens.push_back(item);
+    }
+
+    return tokens;
+}
 
 std::vector<std::string> parser(const std::string& input_string, std::string delimiter="\r\n"){
   
@@ -319,13 +338,70 @@ else if(RESP_array.size() > 2 && RESP_array[2] == "lpop"){
 
       if(type.find(RESP_array[4]) != type.end()){
 
-        send(client_fd, "+string\r\n",strlen("+string\r\n"),0);
+        auto temper = type[RESP_array[4]];
+
+        std::string temp = "+"+temper+"\r\n";
+
+        send(client_fd,temp.c_str(),temp.length(),0);
       }
       else{
+
+        
+
 
         send(client_fd,"+none\r\n",strlen("+none\r\n"),0);
 
       }
+  }
+
+  else if(RESP_array.size()>2 && RESP_array[2]=="xadd"){
+   auto ret_vector = split(RESP_array[6], '-');
+
+   if(ret_vector.size() < 2){
+        std::string err = "-ERR Invalid stream ID\r\n";
+        send(client_fd, err.c_str(), err.length(), 0);
+        continue;
+    }
+
+    long long new_time = std::stoll(ret_vector[0]);
+    long long new_seq  = std::stoll(ret_vector[1]);
+
+    // Validate against last entry if stream is non-empty
+    if (!redis_stream[RESP_array[4]].empty()) {
+        auto& last = redis_stream[RESP_array[4]].back();
+
+        long long last_time = std::stoll(last.time);
+        long long last_seq  = std::stoll(last.seq);
+
+        bool id_too_small = (new_time < last_time) ||
+                            (new_time == last_time && new_seq <= last_seq);
+
+        if (id_too_small) {
+            std::string err = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
+            send(client_fd, err.c_str(), err.length(), 0);
+            return;
+        }
+    }
+
+    // Build and append the new stream entry
+    stream temp;
+    temp.time = ret_vector[0];
+    temp.seq  = ret_vector[1];
+
+    // Fields start at index 8 (key), values at index 10 (value), stepping by 2
+    // RESP_array: [0]=cmd_count [2]=XADD [4]=stream_key [6]=entry_id [8]=field1 [10]=val1 ...
+    for (int j = 8; j < (int)RESP_array.size() - 1; j += 2) {
+        temp.container.push_back(RESP_array[j]);     // field
+        temp.container.push_back(RESP_array[j + 1]); // value
+    }
+
+    redis_stream[RESP_array[4]].push_back(temp);
+    type[RESP_array[4]] = "stream";
+
+    std::string response = "$" + std::to_string(RESP_array[6].length()) +
+                           "\r\n" + RESP_array[6] + "\r\n";
+    send(client_fd, response.c_str(), response.length(), 0);
+   
   }
 
   else{
